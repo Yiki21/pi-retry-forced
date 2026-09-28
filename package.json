@@ -1,0 +1,49 @@
+{
+  "name": "pi-retry-forced",
+  "version": "1.0.0",
+  "description": "Force retry for proxy 400s that Pi's substring-based error classifier misses. Fixes the case where whether a failed turn is retried depends on the digits inside its own request id.",
+  "type": "module",
+  "license": "MIT",
+  "author": "yiki21",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "retry",
+    "proxy",
+    "anthropic",
+    "reliability"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yiki21/pi-retry-forced.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Yiki21/pi-retry-forced/issues"
+  },
+  "homepage": "https://github.com/Yiki21/pi-retry-forced#readme",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist"
+    ]
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
