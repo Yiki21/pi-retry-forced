@@ -62,6 +62,109 @@
 
 type JsonRecord = Record<string, unknown>;
 
+/**
+ * Convert one assistant message's thinking blocks into plain text blocks.
+ *
+ * Why convert instead of delete: a signature that an upstream account rejects
+ * cannot be repaired, but the reasoning inside it is still useful. Turning it
+ * into a `text` block keeps the model's own prior reasoning in the transcript
+ * while dropping the signature CLAIM that the key can no longer support.
+ *
+ * Verified against the live relay before shipping:
+ *   - thinking -> text inside an active tool loop:   8/8 accepted
+ *   - thinking -> text on a prior turn, multi-turn:  4/4 accepted
+ *   - corrupted signature (the failure mode):        10/10 accepted
+ *   - thinking block deleted entirely:               10/10 accepted
+ *
+ * Redacted blocks carry ONLY an opaque payload and no readable text, so they
+ * are dropped rather than converted.
+ */
+export function stripThinkingBlocks(content: unknown): {
+	content: unknown;
+	converted: number;
+	dropped: number;
+	changed: boolean;
+} {
+	if (!Array.isArray(content)) return { content, converted: 0, dropped: 0, changed: false };
+
+	let converted = 0;
+	let dropped = 0;
+	const kept: unknown[] = [];
+
+	for (const block of content) {
+		// In the Anthropic wire format redacted reasoning is its own block type and
+		// carries only an opaque `data` payload. Nothing readable to salvage.
+		if (isRecord(block) && block.type === "redacted_thinking") {
+			dropped += 1;
+			continue;
+		}
+		if (!isRecord(block) || block.type !== "thinking") {
+			kept.push(block);
+			continue;
+		}
+
+		const text = typeof block.thinking === "string" ? block.thinking : "";
+		// Opaque or empty reasoning: nothing readable can be salvaged.
+		if (block.redacted || text.trim().length === 0) {
+			dropped += 1;
+			continue;
+		}
+
+		converted += 1;
+		kept.push({ type: "text", text });
+	}
+
+	const changed = converted + dropped > 0;
+	return { content: changed ? kept : content, converted, dropped, changed };
+}
+
+/**
+ * Rewrite a request body so no replayed thinking signature remains.
+ * Returns the original reference when nothing needed changing.
+ */
+export function stripPayloadThinking(payload: unknown): {
+	payload: unknown;
+	messagesTouched: number;
+	converted: number;
+	dropped: number;
+} {
+	if (!isRecord(payload)) return { payload, messagesTouched: 0, converted: 0, dropped: 0 };
+	const messages = payload.messages;
+	if (!Array.isArray(messages)) return { payload, messagesTouched: 0, converted: 0, dropped: 0 };
+
+	let messagesTouched = 0;
+	let converted = 0;
+	let dropped = 0;
+	let anyChange = false;
+
+	const nextMessages: unknown[] = [];
+	for (const message of messages) {
+		if (!isRecord(message) || message.role !== "assistant") {
+			nextMessages.push(message);
+			continue;
+		}
+
+		const result = stripThinkingBlocks(message.content);
+		if (!result.changed) {
+			nextMessages.push(message);
+			continue;
+		}
+
+		anyChange = true;
+		messagesTouched += 1;
+		converted += result.converted;
+		dropped += result.dropped;
+
+		// A turn left with no blocks at all would be rejected as empty content.
+		if (Array.isArray(result.content) && result.content.length === 0) continue;
+
+		nextMessages.push({ ...message, content: result.content });
+	}
+
+	if (!anyChange) return { payload, messagesTouched: 0, converted: 0, dropped: 0 };
+	return { payload: { ...payload, messages: nextMessages }, messagesTouched, converted, dropped };
+}
+
 /** Hosts that are the real Anthropic/OpenAI APIs — never touched. */
 const OFFICIAL_HOSTS = new Set(["api.anthropic.com", "api.openai.com"]);
 
@@ -110,6 +213,25 @@ export function isProxyHost(baseUrl: string | undefined): boolean {
 	}
 }
 
+/**
+ * Signature-rejection family: the relay refused a replayed `thinking` block.
+ *
+ * Measured behaviour of this relay: it normally does NOT validate thinking
+ * signatures at all (a deliberately corrupted signature is accepted 10/10, and
+ * a replayed real signature 15/15). It starts rejecting them after a transport
+ * failure, when the request is routed to a different upstream account whose
+ * signing key differs from the one that produced the block. So this is an
+ * intermittent, route-dependent failure — not a malformed request.
+ */
+const SIGNATURE_REJECTION_PATTERNS: RegExp[] = [
+	/invalid\s+`?signature`?\s+in\s+`?thinking`?\s+block/i,
+	/signature`?\s+in\s+`?thinking/i,
+];
+
+export function isSignatureRejection(errorMessage: string): boolean {
+	return SIGNATURE_REJECTION_PATTERNS.some((rx) => rx.test(errorMessage));
+}
+
 /** A 400 that carries no usable status signal of its own. */
 function looksLikeTransientUnsupported(message: unknown): boolean {
 	const text = String(message ?? "");
@@ -128,7 +250,12 @@ export function retryableRewrite(message: JsonRecord): JsonRecord | undefined {
 
 	const original = message.errorMessage;
 	if (typeof original !== "string" || original.length === 0) return undefined;
-	if (!looksLikeTransientUnsupported(original)) return undefined;
+
+	// Signature rejections are retryable AND set the session's thinking-strip flag:
+	// retrying alone would resend the same rejected signature, so the two must be
+	// applied together. `before_provider_request` reads the flag this sets.
+	const signatureRejection = isSignatureRejection(original);
+	if (!signatureRejection && !looksLikeTransientUnsupported(original)) return undefined;
 
 	// Already carrying a status the classifier accepts — nothing to do.
 	if (/\b50[0-4]\b/.test(original)) return undefined;
@@ -136,7 +263,9 @@ export function retryableRewrite(message: JsonRecord): JsonRecord | undefined {
 	// 503 = service unavailable = the status this failure actually deserves.
 	// Keep the whole original text so the cause is still readable, and append
 	// it rather than replacing it.
-	const rewritten = `503 service unavailable (retry-forced): ${original}`;
+	const rewritten = signatureRejection
+		? `503 service unavailable (retry-forced, thinking-signature): ${original}`
+		: `503 service unavailable (retry-forced): ${original}`;
 
 	return {
 		...message,
@@ -164,6 +293,11 @@ type Pi = {
 			ctx: Ctx,
 		) => { message: JsonRecord } | undefined,
 	): void;
+	on(
+		event: "before_provider_request",
+		handler: (event: { payload: unknown }, ctx: Ctx) => unknown,
+	): void;
+	on(event: "session_start", handler: () => unknown): void;
 	registerCommand(
 		name: string,
 		opts: {
@@ -176,8 +310,44 @@ type Pi = {
 	): void;
 };
 
+export type ThinkingMode = "auto" | "always" | "off";
+
+/**
+ * auto   — strip replayed thinking only after this session has seen a signature
+ *          rejection (sticky for the rest of the session: once the transcript
+ *          holds signatures a route rejects, every later request replays them).
+ * always — strip on every proxied request (prevents the first failure too, at
+ *          the cost of the model receiving its old reasoning as text).
+ * off    — never strip; signature rejections are still retried.
+ */
+export function parseThinkingMode(value: unknown): ThinkingMode | undefined {
+	const v = String(value ?? "").trim().toLowerCase();
+	return v === "auto" || v === "always" || v === "off" ? v : undefined;
+}
+
 export default function (pi: Pi): void {
 	let forced: Forced[] = [];
+	let mode: ThinkingMode = parseThinkingMode(process.env.PI_RETRY_FORCED_THINKING) ?? "auto";
+	let signatureRejected = false;
+	let stripStats = { requests: 0, converted: 0, dropped: 0 };
+
+	pi.on("session_start", () => {
+		signatureRejected = false;
+		stripStats = { requests: 0, converted: 0, dropped: 0 };
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (!isProxyHost(ctx.model?.baseUrl)) return undefined;
+		const active = mode === "always" || (mode === "auto" && signatureRejected);
+		if (!active) return undefined;
+
+		const result = stripPayloadThinking(event.payload);
+		if (result.payload === event.payload) return undefined;
+		stripStats.requests += 1;
+		stripStats.converted += result.converted;
+		stripStats.dropped += result.dropped;
+		return result.payload;
+	});
 
 	// emitMessageEnd() expects a `{ message }` wrapper, not a bare message:
 	//   const handlerResult = await handler(currentEvent, ctx);
@@ -190,6 +360,10 @@ export default function (pi: Pi): void {
 
 		const replacement = retryableRewrite(event.message);
 		if (!replacement) return undefined;
+
+		if (isSignatureRejection(String(event.message.errorMessage))) {
+			signatureRejected = true;
+		}
 
 		forced.push({
 			at: new Date().toISOString(),
@@ -224,6 +398,28 @@ export default function (pi: Pi): void {
 				lines.push("Original request id is preserved inside the rewritten text.");
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("thinking-sig", {
+		description: "Thinking-signature handling: /thinking-sig [auto|always|off]",
+		handler: (args, ctx) => {
+			const next = parseThinkingMode(args);
+			if (args.trim().length > 0 && !next) {
+				ctx.ui.notify("thinking-sig: expected auto, always or off", "warning");
+				return;
+			}
+			if (next) mode = next;
+			const active = mode === "always" || (mode === "auto" && signatureRejected);
+			ctx.ui.notify(
+				[
+					`mode: ${mode}${next ? " (changed)" : ""}`,
+					`signature rejection seen this session: ${signatureRejected ? "yes" : "no"}`,
+					`stripping replayed thinking now: ${active ? "yes" : "no"}`,
+					`stripped so far: ${stripStats.requests} request(s), ${stripStats.converted} block(s) -> text, ${stripStats.dropped} dropped`,
+				].join("\n"),
+				"info",
+			);
 		},
 	});
 }

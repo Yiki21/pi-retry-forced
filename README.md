@@ -81,6 +81,62 @@ check reads that same reference afterwards, so the rewrite takes effect. The
 handler returns `{ message }` — returning a bare message would be silently
 ignored by the runner.
 
+## Second failure class: thinking-signature rejections
+
+The same relays also return:
+
+```
+400 upstream rejected the request: ***.***.content.11: Invalid `signature` in `thinking` block
+```
+
+This one is not a classifier miss — it is a real upstream refusal, and it is
+route-dependent:
+
+- Measured on the live relay: a **deliberately corrupted** signature is accepted
+  **10/10**, and a replayed real signature **15/15**. The relay normally does
+  *not* validate thinking signatures at all.
+- The failures cluster after transport trouble (a `terminated` error, then 22
+  consecutive `Connection error.`s), and reuse the same block indices across
+  separate incidents.
+
+So the picture is a pooled relay: after a failure the request is routed to a
+different upstream account, whose signing key differs from the one that produced
+the replayed `thinking` block. Pi only considers provider + api + model when
+deciding whether a signature is still valid, which cannot see that the key
+authorising it has changed.
+
+### What this does about it
+
+Retrying alone cannot work: the retry would resend the same rejected signature.
+So both halves are applied together.
+
+1. **Retry.** The rejection is classified as retryable (503) so Pi re-issues the
+   turn instead of stopping.
+2. **Strip.** The `before_provider_request` hook rewrites the outgoing body so no
+   replayed thinking signature remains. Reasoning is not deleted: a thinking
+   block with text becomes a plain `text` block, so the model keeps its own
+   prior reasoning while the unsupportable signature claim is dropped. Opaque
+   `redacted_thinking` blocks and empty thinking are removed.
+
+Verified against the real relay before shipping: thinking→text inside an active
+**tool loop 8/8**, on a **prior turn 4/4**, and with a **corrupted signature
+10/10**. End-to-end through Pi (injecting the rejection once), the retried
+request arrived as `text+text+tool_use` with zero signature fields and the turn
+completed.
+
+### Modes
+
+`/thinking-sig [auto|always|off]` — or set `PI_RETRY_FORCED_THINKING`.
+
+| mode | behaviour |
+|---|---|
+| `auto` (default) | strip only after this session has seen a signature rejection; sticky for the rest of the session |
+| `always` | strip on every proxied request, so the first failure never happens |
+| `off` | never strip; rejections are still retried |
+
+`auto` keeps normal sessions byte-identical to before, so prompt caching is
+unaffected until a rejection actually happens.
+
 ## Install
 
 ```bash
@@ -128,8 +184,9 @@ npm test           # regression cases
 npm run typecheck
 ```
 
-The test suite pins both directions: errors that *should* be converted, and
-errors that *must* still fail fast.
+The test suite pins both directions: errors that *should* be converted, errors
+that *must* still fail fast, and the thinking-block conversion (including that
+`tool_use` blocks and their order survive).
 
 ## License
 

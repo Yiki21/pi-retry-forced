@@ -1,7 +1,7 @@
 {
   "name": "pi-retry-forced",
-  "version": "1.0.0",
-  "description": "Force retry for proxy 400s that Pi's substring-based error classifier misses. Fixes the case where whether a failed turn is retried depends on the digits inside its own request id.",
+  "version": "1.1.0",
+  "description": "Keep Pi running through LLM-relay 400s: retry errors its substring classifier misses, and strip replayed thinking signatures a pooled relay rejects.",
   "type": "module",
   "license": "MIT",
   "author": "yiki21",
@@ -13,7 +13,9 @@
     "retry",
     "proxy",
     "anthropic",
-    "reliability"
+    "reliability",
+    "thinking",
+    "signature"
   ],
   "repository": {
     "type": "git",
