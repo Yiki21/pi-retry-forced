@@ -1,6 +1,6 @@
 {
   "name": "pi-retry-forced",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Keep Pi running through LLM-relay 400s: retry errors its substring classifier misses, and strip replayed thinking signatures a pooled relay rejects.",
   "type": "module",
   "license": "MIT",
@@ -38,12 +38,13 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/",
-    "prepublishOnly": "npm run build"
+    "test": "npm run build && node --test tests/",
+    "prepublishOnly": "npm test"
   },
   "devDependencies": {
+    "@types/node": "^24.10.0",
     "esbuild": "^0.28.1",
-    "typescript": "^7.0.2"
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=20"

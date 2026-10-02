@@ -146,3 +146,108 @@ test("mode parsing", () => {
 	assert.equal(parseThinkingMode(""), undefined);
 	assert.equal(parseThinkingMode("yes"), undefined);
 });
+
+// ---------------------------------------------------------------------------
+// Ordering: the strip flag must be armed before the rewrite decision
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive the real extension handlers with a stub `pi`.
+ *
+ * Returns the registered handlers so a test can play a rejection through
+ * `message_end` and then check what `before_provider_request` does to the next
+ * outgoing payload — which is the only way to observe the two-halves contract.
+ */
+async function driveExtension() {
+	const handlers = new Map();
+	const { default: create } = await import("../dist/index.js");
+	create({
+		on(event, handler) {
+			handlers.set(event, handler);
+		},
+		registerCommand() {},
+	});
+	return handlers;
+}
+
+const PROXY_CTX = { model: { baseUrl: "https://pooled-relay.example/v1", provider: "anthropic", id: "claude" } };
+
+/** A payload carrying a replayed thinking block, which is what must be stripped. */
+const payloadWithThinking = () => ({
+	messages: [
+		{ role: "user", content: [{ type: "text", text: "hi" }] },
+		{
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "internal", signature: "STALE=" },
+				{ type: "text", text: "answer" },
+			],
+		},
+	],
+});
+
+test("a signature rejection carrying a retryable status still arms the strip", async () => {
+	// The 500 here is the whole point: `retryableRewrite` early-returns because Pi's
+	// classifier already accepts 50x, so the flag used to never be set and the retry
+	// resent the rejected signature verbatim.
+	const withRetryableStatus =
+		"500 upstream rejected the request: content.3: Invalid `signature` in `thinking` block (request id: abc123)";
+
+	const handlers = await driveExtension();
+
+	// Before: nothing is stripped, because the flag is unset.
+	const before = handlers.get("before_provider_request")(
+		{ payload: payloadWithThinking() },
+		PROXY_CTX,
+	);
+	assert.equal(before, undefined, "no stripping before any rejection is seen");
+
+	// Play the rejection through message_end.
+	handlers.get("message_end")(
+		{ message: failed(withRetryableStatus) },
+		PROXY_CTX,
+	);
+
+	// After: the next request must have its thinking stripped.
+	const after = handlers.get("before_provider_request")(
+		{ payload: payloadWithThinking() },
+		PROXY_CTX,
+	);
+	assert.ok(after, "the payload must be rewritten once a signature rejection was seen");
+	assert.equal(
+		JSON.stringify(after).includes("STALE="),
+		false,
+		"the rejected signature must not be replayed on the retry",
+	);
+});
+
+test("an unrelated 500 does not arm the strip", async () => {
+	const handlers = await driveExtension();
+	handlers.get("message_end")(
+		{ message: failed("500 internal server error (request id: zzz)") },
+		PROXY_CTX,
+	);
+	assert.equal(
+		handlers.get("before_provider_request")({ payload: payloadWithThinking() }, PROXY_CTX),
+		undefined,
+		"only a signature rejection justifies rewriting history",
+	);
+});
+
+test("off mode never strips even after a rejection", async () => {
+	process.env.PI_RETRY_FORCED_THINKING = "off";
+	try {
+		const handlers = await driveExtension();
+		handlers.get("message_end")(
+			{ message: failed("400 Invalid `signature` in `thinking` block (request id: q)") },
+			PROXY_CTX,
+		);
+		assert.equal(
+			handlers.get("before_provider_request")({ payload: payloadWithThinking() }, PROXY_CTX),
+			undefined,
+			"mode=off disables stripping regardless of what was seen",
+		);
+	} finally {
+		delete process.env.PI_RETRY_FORCED_THINKING;
+	}
+});

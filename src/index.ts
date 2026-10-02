@@ -358,12 +358,19 @@ export default function (pi: Pi): void {
 		if (!isProxyHost(ctx.model?.baseUrl)) return undefined;
 		if (!isRecord(event.message)) return undefined;
 
+		// Arm the strip flag BEFORE asking whether the message should be rewritten.
+		//
+		// `retryableRewrite` returns undefined when the error already carries a status
+		// Pi's classifier accepts (50x), because there is nothing to rewrite — the retry
+		// will happen on its own. But a signature rejection with such a status still needs
+		// the strip, or the retry resends the exact signature that was just rejected, which
+		// is the unrecoverable case this module exists to prevent. Ordering the flag after
+		// the early return skipped exactly that case.
+		const rejectedSignature = isSignatureRejection(String(event.message.errorMessage));
+		if (rejectedSignature) signatureRejected = true;
+
 		const replacement = retryableRewrite(event.message);
 		if (!replacement) return undefined;
-
-		if (isSignatureRejection(String(event.message.errorMessage))) {
-			signatureRejected = true;
-		}
 
 		forced.push({
 			at: new Date().toISOString(),
